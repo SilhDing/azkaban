@@ -55,6 +55,7 @@ import azkaban.utils.JSONUtils;
 import azkaban.utils.Pair;
 import azkaban.utils.Props;
 import azkaban.utils.PropsUtils;
+import azkaban.utils.SecurityTag;
 import azkaban.utils.Utils;
 import azkaban.webapp.AzkabanWebServer;
 import com.google.common.annotations.VisibleForTesting;
@@ -95,7 +96,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static azkaban.Constants.*;
-import static azkaban.project.FeatureFlag.*;
+import static azkaban.Constants.ConfigurationKeys.ENABLE_SECURITY_CERT_MANAGEMENT;
+import static azkaban.project.FeatureFlag.ENABLE_PROJECT_ADHOC_UPLOAD;
 
 
 public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
@@ -156,7 +158,9 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
   private boolean lockdownCreateProjects = false;
   private boolean lockdownUploadProjects = false;
   private boolean enableQuartz = false;
+  private boolean enableSecurityCertManagement = false;
   private boolean disableAdhocUploadWhenProjectUploadLocked = false;
+  private boolean disableJobPropsOverrideWhenProjectUploadLocked = false;
   private String uploadPrivilegeUser;
   private Map<String, List<HTMLFormElement>> alerterPlugins;
 
@@ -179,6 +183,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     this.scheduleManager = server.getScheduleManager();
     this.userManager = server.getUserManager();
     this.scheduler = server.getFlowTriggerScheduler();
+    this.enableSecurityCertManagement = server.getServerProps().getBoolean(ENABLE_SECURITY_CERT_MANAGEMENT, false);
     this.lockdownCreateProjects =
         server.getServerProps().getBoolean(ConfigurationKeys.LOCKDOWN_CREATE_PROJECTS_KEY, false);
     this.enableQuartz = server.getServerProps().getBoolean(ConfigurationKeys.ENABLE_QUARTZ, false);
@@ -197,9 +202,14 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     logger.info("downloadBufferSize: " + this.downloadBufferSize);
 
     // get upload privilege user, if not configured, treated upload as adhoc, no upload lock enabled
+    // this feature flag is fundamental for project security feature enhanced by upload
     this.uploadPrivilegeUser = server.getServerProps().get(AZKABAN_UPLOAD_PRIVILEGE_USER);
+    // a separate feature flag to disable adhoc upload when project upload lock is enabled
     this.disableAdhocUploadWhenProjectUploadLocked =
         server.getServerProps().getBoolean(AZKABAN_DISABLE_ADHOC_UPLOAD_ON_LOCKED, false);
+    // a separate feature flag to disable job props override when project upload lock is enabled
+    this.disableJobPropsOverrideWhenProjectUploadLocked =
+        server.getServerProps().getBoolean(AZKABAN_DISABLE_JOB_PROPS_OVERRIDE_ON_LOCKED, false);
 
     final Map<String, List<HTMLFormElement>> alerterPlugins = new HashMap<>();
     server.getAlerterPlugins().forEach((name, alerter) -> alerterPlugins.put(name,
@@ -435,6 +445,13 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
           ajaxFetchJobInfo(project, ret, req);
         }
       } else if (API_SET_JOB_OVERRIDE_PROPERTY.equals(ajaxName)) {
+        if (uploadPrivilegeUser != null && disableJobPropsOverrideWhenProjectUploadLocked && project.isUploadLocked()) {
+          ret.put(ERROR_PARAM, "Project " + projectName + "is locked for editing job property while upload privilege user "
+              + "is set to " + uploadPrivilegeUser + ". If you really need to edit job property, "
+              + "please contact oncall to remove this lock.");
+          resp.setStatus(HttpServletResponse.SC_FORBIDDEN);
+          return;
+        }
         if (handleAjaxPermission(project, user, Type.WRITE, ret)) {
           ajaxSetJobOverrideProperty(project, ret, req, user);
         }
@@ -747,12 +764,15 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     this.writeJSON(resp, ret);
   }
 
-  private void removeAssociatedSchedules(final Project project) throws ServletException {
+  private void removeAssociatedSchedules(final Project project, final User user) throws ServletException {
     // remove regular schedules
     try {
       for (final Schedule schedule : this.scheduleManager.getSchedules()) {
         if (schedule.getProjectId() == project.getId()) {
-          logger.info("removing schedule {} for project {}", schedule.getScheduleId(), project.getName());
+          logger.info("removing schedule {} for project {} due to project being removed",
+              schedule.getScheduleId(), project.getName());
+          this.projectManager.postProjectEvent(project, EventType.SCHEDULE, user.getUserId(),
+              "removing schedule due to project removed " + schedule.getScheduleId());
           this.scheduleManager.removeSchedule(schedule);
         }
       }
@@ -792,7 +812,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
       return;
     }
 
-    removeAssociatedSchedules(project);
+    removeAssociatedSchedules(project, user);
 
     try {
       this.projectManager.removeProject(project, user);
@@ -1387,13 +1407,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         page.add("projectName", project.getName());
         page.add("projectId", project.getId());
         //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
-        page.add("projectUploadLock", uploadPrivilegeUser != null && project.isUploadLocked());
-        page.add("adhocUpload", project.isAdhocUploadEnabled());
-        page.add("showUploadLockPanel", uploadPrivilegeUser != null);
+        addProjectSidebarProperties(page, project);
 
         page.add("admins", Utils.flattenToString(
             project.getUsersWithPermission(Type.ADMIN), ","));
@@ -1514,14 +1528,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         }
 
         page.add("projectName", project.getName());
-        //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
-        page.add("projectUploadLock", uploadPrivilegeUser != null && project.isUploadLocked());
-        page.add("adhocUpload", project.isAdhocUploadEnabled());
-        page.add("showUploadLockPanel", uploadPrivilegeUser != null);
+        addProjectSidebarProperties(page, project);
 
         page.add("username", user.getUserId());
         page.add("admins", Utils.flattenToString(
@@ -1561,6 +1568,32 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     page.render();
   }
 
+  /**
+   * Project sidebar properties shared by multiple web pages are added here.
+   *
+   * @param page the page to add properties to
+   * @param project the current project to add properties from
+   * */
+  private void addProjectSidebarProperties(Page page, Project project) {
+    // basic project properties
+    page.add("description", project.getDescription());
+    page.add("createTimestamp", project.getCreateTimestamp());
+    page.add("lastModifiedTimestamp", project.getLastModifiedTimestamp());
+    page.add("lastModifiedUser", project.getLastModifiedUser());
+
+    // params for project upload
+    // show if a project has prod identifier
+    page.add("projectUploadLock", uploadPrivilegeUser != null && project.isUploadLocked());
+    page.add("adhocUpload", project.isAdhocUploadEnabled());
+    page.add("showUploadLockPanel", uploadPrivilegeUser != null);
+    // only show adhocUpload changeable button when this feature is enabled
+    page.add("showAdhocUploadFeature",
+        uploadPrivilegeUser != null && disableAdhocUploadWhenProjectUploadLocked);
+    // hide upload project button when project prod identifier is set
+    page.add("hideUploadProjectButton",
+        uploadPrivilegeUser != null && disableAdhocUploadWhenProjectUploadLocked && project.isUploadLocked());
+  }
+
   private void handleJobPage(final HttpServletRequest req, final HttpServletResponse resp,
       final Session session) throws ServletException {
     final Page page = newPage(req, resp, session, "azkaban/webapp/servlet/velocity/jobpage.vm");
@@ -1582,6 +1615,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         throw new AccessControlException("No permission to view project " + projectName + ".");
       }
       page.add("projectName", project.getName());
+      page.add("hideJobPropsEdit",
+          uploadPrivilegeUser != null && disableJobPropsOverrideWhenProjectUploadLocked && project.isUploadLocked());
 
       final Flow flow = project.getFlow(flowNodePath);
       if (flow == null) {
@@ -1851,13 +1886,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         page.add("projectName", project.getName());
         page.add("projectId", project.getId());
         //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
-        page.add("projectUploadLock", uploadPrivilegeUser != null && project.isUploadLocked());
-        page.add("adhocUpload", project.isAdhocUploadEnabled());
-        page.add("showUploadLockPanel", uploadPrivilegeUser != null);
+        addProjectSidebarProperties(page, project);
 
         page.add("admins", Utils.flattenToString(
             project.getUsersWithPermission(Type.ADMIN), ","));
@@ -1926,7 +1955,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
       status = ERROR_PARAM;
     } else {
       try {
-        this.projectManager.createProject(projectName, projectDescription, user);
+        this.projectManager.createProject(projectName, projectDescription, user,
+            enableSecurityCertManagement ? SecurityTag.NEW_PROJECT : null);
         status = "success";
         action = "redirect";
         final String redirect = "manager?project=" + projectName;
@@ -2042,15 +2072,25 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         logger.info("Removed schedule with id {} of renamed/deleted flow: {} from project: {}.",
                 schedule.getScheduleId(), schedule.getFlowName(), schedule.getProjectName());
         this.projectManager.postProjectEvent(project, EventType.SCHEDULE, "azkaban",
-                "Schedule " + schedule.toString() + " has been removed.");
+                "Schedule " + schedule.toString() +
+                    " has been removed due to the flow has been removed or renamed during upload process.");
       });
 
       // uploader is upload privilege user and the project is not protected by feature flag enable.project.adhoc.upload
       // mark the project with UPLOAD LOCK if it is not already, and persist in DB
       if (!project.isAdhocUploadEnabled() && user.getUserId().equals(uploadPrivilegeUser) && !project.isUploadLocked()) {
-          project.setUploadLock(true);
-          this.projectManager.updateProjectSetting(project);
-          logger.info("Project {} is Upload Locked", project.getName());
+        project.setUploadLock(true);
+        this.projectManager.updateProjectSetting(project);
+        logger.info("Project {} is PROD", project.getName());
+      } else if (uploadPrivilegeUser != null && !user.getUserId().equals(uploadPrivilegeUser)) {
+        // when project security lock feature is turned on (only prod project flows would be allowed to push to prod cluster)
+        // and uploader not the upload privileged user, we want to reset prod lock status to false
+        // so that we remain the same restriction "prod project flows would be allowed to push to prod cluster"
+        // regardless we enable/disable AdhocUploadWhenProjectUploadLocked completely
+        project.setUploadLock(false);
+        this.projectManager.updateProjectSetting(project);
+        logger.info("Project {} is non PROD due to uploader {} is not uploadPrivilegeUser {}",
+            project.getName(), user.getUserId(), uploadPrivilegeUser);
       }
 
       registerErrorsAndWarningsFromValidationReport(resp, ret, reports);

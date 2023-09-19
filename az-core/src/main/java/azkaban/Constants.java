@@ -199,6 +199,10 @@ public class Constants {
    * Disable adhoc upload on upload-locked projects
    */
   public static final String AZKABAN_DISABLE_ADHOC_UPLOAD_ON_LOCKED = "azkaban.disable.adhoc.upload.on.locked";
+  /*
+   * Disable job properties edit via UI or API on upload-locked projects
+   */
+  public static final String AZKABAN_DISABLE_JOB_PROPS_OVERRIDE_ON_LOCKED = "azkaban.disable.job.props.override.on.locked";
 
   // Azkaban event reporter constants
   public static class EventReporterConstants {
@@ -459,6 +463,9 @@ public class Constants {
 
     public static final String SECURITY_USER_GROUP = "azkaban.security.user.group";
 
+    // A config to control whether to enable new security model to dynamically change ACLs
+    public static final String ENABLE_SECURITY_CERT_MANAGEMENT = "azkaban.enable.security.cert.management";
+
     public static final String CSR_KEYSTORE_LOCATION = "azkaban.csr.keystore.location";
 
     // dir to keep dependency plugins
@@ -588,6 +595,12 @@ public class Constants {
     * is uploaded by "upload.privilege.user".
     * */
     public static final String AZKABAN_FLOW_PRODUCTION_MARKER = "azkaban.flow.production.marker";
+    /*
+    * A flag to indicate whether the flow should use adhoc certificate or not.
+    * If the flag is set to true, the flow would use adhoc certificate in init container.
+    * Otherwise, the flow would use the existing/default certificate in init container.
+    * */
+    public static final String AZKABAN_FLOW_ADHOC_CERTIFICATE = "azkaban.flow.adhoc.certificate";
   }
 
   public static class JobProperties {
@@ -922,7 +935,7 @@ public class Constants {
 
     public static FlowRetryStrategy valueFromName(String name) {
       for(FlowRetryStrategy s: FlowRetryStrategy.values()) {
-        if(s.name.equals(name)) {
+        if(s.name.equals(name) || s.name().equals(name)) {
           return s;
         }
       }
